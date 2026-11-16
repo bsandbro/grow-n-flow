@@ -161,6 +161,79 @@ Worth adding at the proxy:
 - a rate limit on `/api/` (e.g. `limit_req`, about 5 r/s with a small burst),
 - the security headers listed below.
 
+## Game data and logs
+
+### Where things are recorded
+
+Gameplay is recorded in MongoDB, not in log files.
+
+| Collection | What it holds | Identifies a person? |
+|---|---|---|
+| `users` | email, optional username, bcrypt password hash, account timestamps | **Yes, directly** |
+| `sessions` | active login sessions: session ID (a live login token), user ID, email, username | **Yes, and the IDs can be used to log in as the user** |
+| `matches` | one document per game: full game state (`G`: fish, plants, money, water chemistry, events, last action), turn info, timestamps, `ownerUserId` | Indirectly, via `ownerUserId` → `users` |
+| `water_readings` | per-day snapshots of each match (water parameters, deaths, events), keyed by `matchID` | Indirectly, via the match |
+
+Server output is secondary:
+
+- **Backend output:** `docker compose logs backend` (or `podman compose logs backend`). It shows match IDs, game actions and errors. It doesn't print emails or usernames, so keep it that way when adding logging.
+- **Reverse proxy access logs:** these record client IP addresses, plus the login name if you use basic auth. Treat them as personal data, rotate them, and don't share them.
+
+### Getting the data out
+
+`backend/scripts/db-dump.sh` makes a raw backup and, optionally, a pseudonymized export for analysis. It needs only Docker or Podman. The database tools run inside containers, and the pseudonymizing step runs in a throwaway container with no network access.
+
+```bash
+# Raw backup only. Contains emails and password hashes: treat as sensitive.
+backend/scripts/db-dump.sh
+
+# Backup + pseudonymized JSON for analysis
+export REDACT_KEY=...   # see below
+backend/scripts/db-dump.sh --redact
+
+# Pseudonymized JSON only (raw backup deleted afterwards), plus a per-match summary
+backend/scripts/db-dump.sh --redact --no-keep-raw --analyze
+
+# Pseudonymize a backup made earlier
+backend/scripts/db-dump.sh --redact --from ~/gnf-dumps/aquaponics_dev_....gz
+
+# Podman instead of Docker
+CONTAINER=podman backend/scripts/db-dump.sh --redact
+```
+
+Output goes to `~/gnf-dumps/` (change with `DUMP_DIR`). The script creates the directory with mode 700 and writes its files with mode 600.
+
+### What the pseudonymized export contains
+
+`backend/scripts/redact-export.js` works from an allowlist:
+
+- **Only `users`, `matches` and `water_readings` are exported.** `sessions` is never exported. Any collection added later is skipped until someone adds it to the allowlist on purpose. The export header lists what was skipped.
+- **`users` is reduced** to a pseudonym, account creation date and last login date. Email, username, password hash and exact times are dropped.
+- **`matches`** keeps game state, turn info and timestamps, with the owner replaced by the same pseudonym, so games can be grouped by player.
+- **`water_readings`** is kept as is; it contains simulation data only.
+- **Pseudonyms are keyed:** `HMAC-SHA256(REDACT_KEY, user id)`, truncated to 12 hex characters.
+  - The same player gets the same pseudonym in every export made with the same key, so you can follow a player across exports.
+  - Without the key, a pseudonym can't be reversed. An unkeyed hash of an email address could be, simply by hashing every address on a class roster and comparing.
+
+**Handling `REDACT_KEY`:**
+- Generate it once with `openssl rand -hex 32`.
+- Store it like a password, somewhere other than the dump directory.
+- Never send it with an export.
+- If you lose it, future exports will use new pseudonyms.
+- If it leaks, rotate it. Exports made with the old key should then be treated as if they contained user IDs.
+
+### What a keyed pseudonym does not do
+
+A pseudonymized export is not an anonymous one. Even without names:
+
+- In a small group, a distinctive game history or play times can still single someone out to anyone who knows when or how a particular person played.
+- Match timestamps are kept at full precision because analysis needs them, for example to measure session length and time between turns.
+
+So:
+- Share exports only with people who need them.
+- Delete raw backups and exports when you're done with them.
+- When publishing results, report aggregates rather than per-player rows.
+
 ## Lessons from the first deployment
 
 These caused real trouble or were caught in review:
@@ -178,9 +251,9 @@ A checklist, roughly in priority order:
 **Must do**
 - [ ] HTTPS only, with `NODE_ENV=production`, a real `SESSION_SECRET`, and `TRUST_PROXY=1` if behind a proxy.
 - [ ] Mongo isn't reachable from the internet. If it's on a shared network or Atlas, turn on authentication.
-- [ ] Backups: a nightly `mongodump` copied somewhere off the server. Test a restore once.
+- [ ] Backups: run `backend/scripts/db-dump.sh` nightly (cron or a systemd timer) and copy the result somewhere off the server. Test a restore once.
 - [ ] Decide who can register: set `SIGNUP_SECRET`, put basic auth at the proxy, or accept open signup knowingly.
-- [ ] If students use it, check your institution's rules on storing student data (FERPA in the US) before picking a hosting provider.
+- [ ] If students use it, check your institution's rules on storing student data before picking a hosting provider.
 
 **Should do**
 - [ ] Serve the built frontend instead of the Vite dev server.
